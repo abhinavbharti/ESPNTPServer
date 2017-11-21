@@ -20,9 +20,11 @@
  *      Author: liebman
  */
 
+#if defined(ESP_PLATFORM)
 #define AVOID_FLUSH // https://github.com/espressif/arduino-esp32/issues/854
+#endif
 //#define USE_ASYNC_UDP
-#define USE_NO_WIFI
+//#define USE_NO_WIFI
 #define LOG_HOST "192.168.0.31"
 #define LOG_PORT 1421
 

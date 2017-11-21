@@ -602,10 +602,16 @@ void setup()
 
 #if !defined(USE_NO_WIFI)
     WiFiManager wifi;
-    wifi.setDebugOutput(false);
+    //wifi.setDebugOutput(false);
+#if defined(ESP_PLATFORM)
+    String ssid = "ESPNTPServer" + WiFi.macAddress();
+#else
     String ssid = "ESPNTPServer" + String(ESP.getChipId());
+#endif
     wifi.autoConnect(ssid.c_str(), NULL);
+#if !defined(ESP_PLATFORM)
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
 #if defined(LOG_HOST) && defined(LOG_PORT)
     dbnetlog(LOG_HOST, LOG_PORT);
     dbprintln("Network logging started!");
