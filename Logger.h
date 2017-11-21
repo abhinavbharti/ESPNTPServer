@@ -23,8 +23,13 @@
 #ifndef LOGGER_H_
 #define LOGGER_H_
 
+
 #include <Arduino.h>
+#if defined(ESP_PLATFORM)
+#include <WiFi.h>
+#else
 #include <ESP8266WiFi.h>
+#endif
 
 #define USE_TCP
 //#define USE_NETWORK
@@ -39,6 +44,7 @@
 
 #define LOGGER_DEFAULT_BAUD 115200L
 #define LOGGER_BUFFER_SIZE  256
+#define CONNECT_FAIL_COUNT  3
 
 class Logger {
 public:

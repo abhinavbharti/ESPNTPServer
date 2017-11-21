@@ -27,14 +27,17 @@
 #include "Logger.h"
 
 Ticker            validityTimer;
-bool              valid;
-bool              gps_valid;
-uint32_t          pps_valid_count;
+volatile bool     valid;
+volatile bool     gps_valid;
+uint32_t          valid_in;
+volatile time_t   since;
+volatile char     reason[128];
+time_t            first_gps_valid;
 volatile uint32_t valid_count;  // how many times we have gone from invalid to valid
 bool              sentence_unknown;
 uint32_t          bad_checksum_count;
-uint32_t          req_count;
-uint32_t          rsp_count;
+volatile uint32_t req_count;
+volatile uint32_t rsp_count;
 int8_t            precision;
 volatile uint32_t dispersion;
 
@@ -56,11 +59,16 @@ AsyncUDP udp;
 WiFiUDP udp;
 #endif
 
+#if defined(ESP_PLATFORM)
+HardwareSerial gps(2);
+#else
 SoftwareSerial gps(GPS_RX_PIN, GPS_TX_PIN, false, SERIAL_BUFFER_SIZE);
+#endif
 char           nmeaBuffer[NMEA_BUFFER_SIZE];
 MicroNMEA      nmea(nmeaBuffer, NMEA_BUFFER_SIZE);
 
 SSD1306Wire    display(0x3c, SDA, SCL);
+volatile bool  display_now;
 
 #ifdef NTP_PACKET_DEBUG
 void dumpNTPPacket(NTPPacket* ntp)
@@ -85,16 +93,50 @@ void dumpNTPPacket(NTPPacket* ntp)
 #define dumpNTPPacket(x)
 #endif
 
-void invalidate()
+void invalidateTime();
+
+void invalidate(const char* fmt, ...)
 {
+    va_list argp;
+    va_start(argp, fmt);
+    if (reason[0] != '\0')
+    {
+        vsnprintf((char*)reason, sizeof(reason)-1, fmt, argp);
+    }
+    va_end(argp);
+
+    if (valid)
+    {
+        since = seconds;
+    }
+
     valid       = false;
     gps_valid   = false;
     last_micros = 0;
+    valid_in    = 0;
+    nmea.clear();
+
+    //
+    // restart the validity timer, if it runs out we invalidate our data.
+    //
+    display_now = true;
 }
+
+void invalidateTime()
+{
+    invalidate("Timer: %f\n", us2s(micros()-last_micros));
+    validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidateTime);
+}
+
 
 void oneSecondInterrupt()
 {
     uint32_t cur_micros = micros();
+
+    //
+    // restart the validity timer, if it runs out we invalidate our data.
+    //
+    validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidateTime);
 
     //
     // don't trust PPS if GPS is not valid.
@@ -104,26 +146,24 @@ void oneSecondInterrupt()
         return;
     }
 
+    display_now = true;
+
     //
     // if we are still counting down then keep waiting
     //
-    if (pps_valid_count)
+    if (valid_in)
     {
-        --pps_valid_count;
-        if (pps_valid_count == 0)
+        --valid_in;
+        if (valid_in == 0)
         {
             // clear stats and mark us valid
-            min_micros = 0;
-            max_micros = 0;
-            valid      = true;
+            min_micros  = 0;
+            max_micros  = 0;
+            valid       = true;
+            since       = seconds;
             ++valid_count;
         }
     }
-
-    //
-    // restart the validity timer, if it runs out we invalidate our data.
-    //
-    validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidate);
 
     //
     // increment seconds
@@ -260,7 +300,7 @@ void recievePacket()
     ntp.stratum    = 1;
     ntp.precision  = precision;
     // TODO: compute actual root delay, and root dispersion
-    ntp.delay = (uint32)(0.000001 * 65536);
+    ntp.delay = (uint32_t)(0.000001 * 65536);
     ntp.dispersion = dispersion;
     strncpy((char*)ntp.ref_id, REF_ID, sizeof(ntp.ref_id));
     ntp.orig_time  = ntp.xmit_time;
@@ -280,7 +320,6 @@ void recievePacket()
     ntp.xmit_time.fraction = htonl(ntp.xmit_time.fraction);
 #if defined(USE_ASYNC_UDP)
     aup.write((uint8_t*)&ntp, sizeof(ntp));
-    ++rsp_count;
 #else
     IPAddress address = udp.remoteIP();
     uint16_t port     = udp.remotePort();
@@ -289,6 +328,7 @@ void recievePacket()
     udp.flush();
     udp.endPacket();
 #endif
+    ++rsp_count;
 }
 
 void badChecksum(MicroNMEA& mn)
@@ -300,14 +340,59 @@ void badChecksum(MicroNMEA& mn)
 void unknownSentence(MicroNMEA& mn)
 {
     const char* sentence = mn.getSentence();
-    dbprintf("unknownSentence: %s\n", sentence);
 
-    if (!strncmp("$PMTK", sentence, 5))
+    //
+    // 103 - about to restart
+    // 105 - restart complete
+    //
+    if (!strncmp(sentence, "$PGACK,103*40", 13) || !strncmp(sentence, "$PGACK,105*46", 13))
+    {
+        invalidate("restarting: %s", sentence);
+        return;
+    }
+
+    //
+    // ignore startup seq.
+    //
+    if (!strncmp(sentence, "$PMTK011,MTKGPS*08", 18) || !strncmp(sentence, "$PMTK010,001*2E", 15))
     {
         return;
     }
 
+    if (!strncmp(sentence, "$PMTK001,314,3*36", 16))
+    {
+        dbprintf("sentence acked: %s\n", sentence);
+        return;
+    }
+
+    if (!strncmp(sentence, "$PMTK010,002*2D", 15))
+    {
+        dbprintf("gps startup complete: %s\n", sentence);
+        sentence_unknown = true;
+        return;
+    }
+
+    if (!strncmp("$PGACK", sentence, 6))
+    {
+        dbprintf("ack recieved: %s\n", sentence);
+        return;
+    }
+
+    dbprintf("unknownSentence: %s\n", sentence);
+
     sentence_unknown = true;
+}
+
+void sendSentence(const char* sentence)
+{
+    static char cksum[3];
+    MicroNMEA::generateChecksum(sentence, cksum);
+    cksum[2] = '\0';
+    dbprintf("sendSentence: '%s*%s'\n", sentence, cksum);
+    gps.printf("%s*%s\r\n", sentence, cksum);
+#if !defined(AVOID_FLUSH)
+    gps.flush();
+#endif
 }
 
 void resetGPS()
@@ -323,7 +408,6 @@ void resetGPS()
     delay(100);
     digitalWrite(GPS_EN_PIN, HIGH);
 
-#if 0
     dbprintln("resetGPS: waiting on first sentence");
     dbflush();
 
@@ -338,12 +422,18 @@ void resetGPS()
             {
                 const char* sentence = nmea.getSentence();
                 dbprintf("resetGPS: done, sentence: '%s'\n", sentence);
-                dbflush();
+#if 0
+                dbprintln("setting baud rate to 38400!");
+                sendSentence("$PMTK251,38400");
+#if !defined(AVOID_FLUSH)
+                gps.flush();
+#endif
+                gps.begin(38400);
+#endif
                 return;
             }
         }
     }
-#endif
 }
 
 void processGPS()
@@ -356,7 +446,8 @@ void processGPS()
     //
     if ((last_valid && !valid) || (last_gps_valid && !gps_valid))
     {
-        dbprintln("INVALID!");
+        dbprintf("INVALID: '%s'\n", reason);
+        reason[0] = '\0';
     }
     else if (!last_valid && valid)
     {
@@ -369,12 +460,14 @@ void processGPS()
     {
         if (nmea.process(gps.read()))
         {
+            //dbprintf("sentence: %s\n", nmea.getSentence());
             //
             // if it was a GGA and its valid then check and maybe update the time
             //
             const char * id = nmea.getMessageID();
             if (nmea.isValid() && nmea.getYear() > 2000 && strcmp("GGA", id) == 0)
             {
+                static bool timewarp = false;  // true if prev pass was timewarp
                 static struct tm tm;
                 tm.tm_year         = nmea.getYear() - 1900;
                 tm.tm_mon          = nmea.getMonth() - 1;
@@ -382,13 +475,37 @@ void processGPS()
                 tm.tm_hour         = nmea.getHour();
                 tm.tm_min          = nmea.getMinute();
                 tm.tm_sec          = nmea.getSecond();
-                time_t new_seconds = mktime(&tm);
 
+                time_t new_seconds = mktime(&tm);
                 time_t old_seconds = seconds;
-                if (old_seconds != new_seconds)
+
+                if (old_seconds < new_seconds)
                 {
+                    if (valid)
+                    {
+                        invalidate("%ld missing seconds!", new_seconds-old_seconds);
+                    }
                     seconds = new_seconds;
                     dbprintf("%010lu: %s adjusting seconds from %lu to %lu\n", millis(), nmea.getMessageID(), old_seconds, new_seconds);
+                }
+                else if (old_seconds > new_seconds)
+                {
+                    if (valid)
+                    {
+                        if (timewarp)
+                        {
+                            invalidate("timewarp %ld", new_seconds-old_seconds);
+                            timewarp = false;
+                        }
+                        else
+                        {
+                            timewarp = true;
+                        }
+                    }
+                    else
+                    {
+                        seconds = new_seconds;
+                    }
                 }
 
                 //
@@ -397,7 +514,11 @@ void processGPS()
                 if (!gps_valid)
                 {
                     gps_valid       = true;
-                    pps_valid_count = PPS_VALID_COUNT;
+                    valid_in = PPS_VALID_COUNT;
+                    if (!first_gps_valid)
+                    {
+                        first_gps_valid = seconds;
+                    }
                     dbprintln("gps valid!");
                 }
             }
@@ -405,21 +526,60 @@ void processGPS()
     }
 }
 
-void sendSentence(const char* sentence)
+void updateDisplay()
 {
-    static char cksum[3];
-    MicroNMEA::generateChecksum(sentence, cksum);
-    cksum[2] = '\0';
-    dbprintf("sendSentence: '%s*%s'\n", sentence, cksum);
-    gps.printf("%s*%s\r\n", sentence, cksum);
-    gps.flush();
+    static bool blink;
+    const int buf_size = 80;
+    char buf[buf_size];
+    struct tm t;
+
+    display.clear();
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_10);
+    time_t now = seconds;
+    gmtime_r(&now, &t);
+    snprintf(buf, buf_size-1, "UTC: %04d/%02d/%02d %02d:%02d:%02d", t.tm_year+1900, t.tm_mon+1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    display.drawString(0, 0,  buf);
+    display.drawString(0, 10, "Address: "+WiFi.localIP().toString());
+    display.drawString(0, 20, "R&R:  " + String(req_count) + " / " + String(rsp_count));
+    display.drawString(0, 30, "Sat Count: " + String(nmea.getNumSatellites()));
+
+    if (valid_in)
+    {
+        snprintf(buf, buf_size-1, "valid in: %02u", valid_in);
+        String value(buf);
+        uint16_t w = display.getStringWidth(value);
+        display.drawString(128-w, 30, value);
+    }
+
+    gmtime_r(&first_gps_valid, &t);
+    snprintf(buf, buf_size-1, "%04d/%02d/%02d %02d:%02d:%02d", t.tm_year+1900, t.tm_mon+1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    display.drawString(0, 40, "Start: " + String(buf));
+    gmtime_r((time_t*)&since, &t);
+    if (valid)
+    {
+        snprintf(buf, buf_size-1, "Valid: %04d/%02d/%02d %02d:%02d:%02d", t.tm_year+1900, t.tm_mon+1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+        display.drawString(0, 50, String(buf));
+    }
+    else
+    {
+        if (blink)
+        {
+            snprintf(buf, buf_size-1, "Invld: %04d/%02d/%02d %02d:%02d:%02d", t.tm_year+1900, t.tm_mon+1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+            display.drawString(0, 50, String(buf));
+        }
+        blink = !blink;
+    }
+    // write the buffer to the display
+    display.display();
 }
 
 void setup()
 {
     delay(5000); // delay for IDE to re-open serial
+    gps.begin(9600);
     dbbegin(115200);
-    dbprintln("\n\nStartup!");
+    dbprintln("\n\nStartup!\n");
 
     pinMode(SYNC_PIN, INPUT);
 #if defined(LED_PIN)
@@ -440,8 +600,13 @@ void setup()
 #if !defined(USE_NO_WIFI)
     WiFiManager wifi;
     wifi.setDebugOutput(false);
-    String ssid = "SynchroClock" + String(ESP.getChipId());
+    String ssid = "ESPNTPServer" + String(ESP.getChipId());
     wifi.autoConnect(ssid.c_str(), NULL);
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#if defined(LOG_HOST) && defined(LOG_PORT)
+    dbnetlog(LOG_HOST, LOG_PORT);
+    dbprintln("Network logging started!");
+#endif
 #endif
 
     if (!display.init())
@@ -450,14 +615,19 @@ void setup()
     }
     display.flipScreenVertically();
     display.setFont(ArialMT_Plain_10);
+    display.clear();
+    display.drawString(0, 0, "Starting GPS...");
+    display.display();
 
-    gps.begin(9600);
     nmea.setBadChecksumHandler(&badChecksum);
     nmea.setUnknownSentenceHandler(&unknownSentence);
     resetGPS();
 
-    precision = computePrecision();
+    display.drawString(0, 10, "Done!");
+    display.display();
 
+    precision = computePrecision();
+#if !defined(USE_NO_WIFI)
     //
     // initialize UDP handler
     //
@@ -472,12 +642,20 @@ void setup()
         delay(1000);
         dbprintf("setup: retrying!\n");
     }
+#endif
 
     attachInterrupt(SYNC_PIN, &oneSecondInterrupt, FALLING);
 
 #if defined(USE_ASYNC_UDP)
     udp.onPacket(recievePacket);
 #endif
+
+    // start teh validity timer, it also schedules a display
+    validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidateTime);
+    display_now = true;
+    first_gps_valid = 0;
+    reason[0] = '\0';
+    strncpy((char*)reason, "<unknown>", sizeof(reason)-1);
 }
 
 void loop()
@@ -500,9 +678,8 @@ void loop()
     static time_t last_seconds;
     if (seconds != last_seconds)
     {
-        if (seconds != last_seconds && ((seconds % 60) == 0 || pps_valid_count))
+        if (seconds != last_seconds && ((seconds % 60) == 0 || valid_in))
         {
-
 #if defined(MICROS_HISTORY_SIZE)
             double mean = 0.0;
             for (int i = 0; i < micros_history_count; ++i)
@@ -521,8 +698,8 @@ void loop()
 #endif
             double disp = us2s(MAX(abs(MICROS_PER_SEC-max_micros), abs(MICROS_PER_SEC-min_micros)));
             dispersion  = (uint32_t)(disp * 65536.0);
-            dbprintf("min:%lu max:%lu jitter:%lu valid_count:%lu valid:%s numsat:%d heap:%ld pps_valid_count:%d badcs: %lu\n", min_micros, max_micros,
-                    max_micros - min_micros, valid_count, valid ? "true" : "false", nmea.getNumSatellites(), ESP.getFreeHeap(), pps_valid_count,
+            dbprintf("min:%lu max:%lu jitter:%lu valid_count:%lu valid:%s numsat:%d heap:%ld valid_in:%d badcs: %lu\n", min_micros, max_micros,
+                    max_micros - min_micros, valid_count, valid ? "true" : "false", nmea.getNumSatellites(), ESP.getFreeHeap(), valid_in,
                     bad_checksum_count);
         }
 
@@ -531,22 +708,15 @@ void loop()
             dbprintf("OOPS: time went backwards: last:%lu now:%lu\n", last_seconds, seconds);
         }
 
-        //
-        // Update the display
-        //
-        display.clear();
-        display.setTextAlignment(TEXT_ALIGN_LEFT);
-        display.setFont(ArialMT_Plain_10);
-        const char* current_time = ctime(&last_seconds);
-        display.drawString(0, 0,  current_time);
-        display.drawString(0, 10, "Address:    "+WiFi.localIP().toString());
-        display.drawString(0, 20, "Sat Count: " + String(nmea.getNumSatellites()));
-        display.drawString(0, 30, "Requests:  " + String(req_count));
-        display.drawString(0, 40, "Responses: " + String(rsp_count));
-        // write the buffer to the display
-        display.display();
     }
 
     last_seconds = seconds;
+
+    if (display_now)
+    {
+        display_now = false;
+        updateDisplay();
+    }
     delay(1);
 }
+

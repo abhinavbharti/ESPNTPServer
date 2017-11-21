@@ -20,17 +20,49 @@
  *      Author: liebman
  */
 
-#define USE_ASYNC_UDP
-//#define USE_NO_WIFI
+#define AVOID_FLUSH // https://github.com/espressif/arduino-esp32/issues/854
+//#define USE_ASYNC_UDP
+#define USE_NO_WIFI
+#define LOG_HOST "192.168.0.31"
+#define LOG_PORT 1421
 
 #ifndef _ESPNTPServer_H_
 #define _ESPNTPServer_H_
 #include "Arduino.h"
+#if defined(ESP_PLATFORM)
+class Ticker {
+public:
+  hw_timer_t * timer = NULL;
+  void attach_ms(unsigned int milis, void  func())
+  {
+      unsigned int micros = milis * 1000;
+      // Use 1st timer of 4 (counted from zero).
+      // Set 80 divider for prescaler (see ESP32 Technical Reference Manual for more
+      // info).
+      timer = timerBegin(0, 80, true);
+
+      // Attach onTimer function to our timer.
+      timerAttachInterrupt(timer, func, true);
+
+      // Set alarm to call onTimer function every second (value in microseconds).
+      // Repeat the alarm (third parameter)
+      timerAlarmWrite(timer, micros, false);
+
+      // Start an alarm
+      timerAlarmEnable(timer);
+  }
+};
+
+
+#else
 #include "Ticker.h"
+#endif
 #if !defined(USE_NO_WIFI)
 #include "WiFiManager.h"
 #endif
+#if !defined(ESP_PLATFORM)
 #include "SoftwareSerial.h"
+#endif
 #include "MicroNMEA.h"
 #include <time.h>
 
@@ -42,12 +74,19 @@
 #include <WiFiUdp.h>
 #endif
 
+#if defined(ESP_PLATFORM)
+#define SYNC_PIN               19
+#define GPS_RX_PIN             16
+#define GPS_TX_PIN             17
+#define GPS_EN_PIN             18
+#else
 // pin definitions
 #define LED_PIN                BUILTIN_LED   // LED on pin, active low
 #define SYNC_PIN               D5   // (GPIO14) pin tied to 1hz square wave from GPS
 #define GPS_RX_PIN             D6   // (GPIO12)
 #define GPS_TX_PIN             D7   // (GPIO13)
 #define GPS_EN_PIN             D4   // (GPIO2)
+#endif
 
 #define NTP_PORT               123
 

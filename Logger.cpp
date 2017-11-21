@@ -22,7 +22,12 @@
 
 #include "Logger.h"
 
+#if defined(ESP_PLATFORM)
+#define AVOID_FLUSH // https://github.com/espressif/arduino-esp32/issues/854
+#endif
+
 #define DEBUG
+
 
 #ifdef DEBUG
 
@@ -35,7 +40,11 @@
 extern unsigned int snprintf(char*, unsigned int, ...);
 #define dbprintf(...)  {char dbp_buf[DBP_BUF_SIZE]; snprintf(dbp_buf, DBP_BUF_SIZE-1, __VA_ARGS__); Serial.print(dbp_buf);}
 #define dbprintln(x)   Serial.println(x)
+#if !defined(AVOID_FLUSH)
 #define dbflush()      Serial.flush()
+#else
+#define dbflush()
+#endif
 #endif
 
 Logger::Logger()
@@ -44,7 +53,7 @@ Logger::Logger()
 	_port       = 0;
 	_failed     = 0;
 #if defined(USE_NETWORK) && defined(USE_TCP)
-	_client.setTimeout(1000); // 1 second connect timeout
+	_client.setTimeout(500); // 1/2 second connect timeout
 #endif
 }
 
@@ -75,7 +84,9 @@ void Logger::println(const char* message)
 {
     snprintf(_buffer, LOGGER_BUFFER_SIZE-1, "%s\n", message);
     Serial.print(_buffer);
+#if !defined(AVOID_FLUSH)
     Serial.flush();
+#endif
 #if defined(USE_NETWORK)
     send(_buffer);
 #endif
@@ -100,7 +111,9 @@ void Logger::printf(const char* fmt, ...)
 
 void Logger::flush()
 {
+#if !defined(AVOID_FLUSH)
     Serial.flush();
+#endif
 #if defined(USE_NETWORK) && defined(USE_TCP)
     if (_client.connected())
     {
@@ -122,7 +135,7 @@ void Logger::send(const char* message)
 
     if (!WiFi.isConnected())
     {
-        dbprintln("Logger::log: not connected!");
+        dbprintln("Logger::log: WiFi not connected!");
         return;
     }
 
@@ -133,11 +146,16 @@ void Logger::send(const char* message)
     }
 
 #if  defined(USE_TCP)
-    if (!_client.connected() && _failed < 3) // try 3 times at most to connect then give up.
+    if (!_client.connected())
     {
-        if(!_client.connect(ip, _port) && _failed < 3)
+        if (_failed >= CONNECT_FAIL_COUNT) // try CONNECT_FAIL_COUNT times at most to connect then give up.
         {
-        	    _failed++;
+            return;
+        }
+
+        if(!_client.connect(ip, _port))
+        {
+            _failed++;
             dbprintf("Logger::send failed to connect!\n");
             return;
         }
@@ -146,6 +164,7 @@ void Logger::send(const char* message)
     if (_client.write(message) != strlen(message))
     {
         dbprintf("Logger::write failed to write message: %s\n", message);
+        _client.clearWriteError();
         return;
     }
     _client.flush();
