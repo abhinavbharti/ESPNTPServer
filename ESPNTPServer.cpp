@@ -95,7 +95,7 @@ void dumpNTPPacket(NTPPacket* ntp)
 
 void invalidateTime();
 
-void invalidate(const char* fmt, ...)
+void IRAM_ATTR invalidate(const char* fmt, ...)
 {
     va_list argp;
     va_start(argp, fmt);
@@ -122,14 +122,14 @@ void invalidate(const char* fmt, ...)
     display_now = true;
 }
 
-void invalidateTime()
+void IRAM_ATTR invalidateTime()
 {
     invalidate("Timer: %f\n", us2s(micros()-last_micros));
     validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidateTime);
 }
 
 
-void oneSecondInterrupt()
+void IRAM_ATTR oneSecondInterrupt()
 {
     uint32_t cur_micros = micros();
 
@@ -359,6 +359,9 @@ void unknownSentence(MicroNMEA& mn)
         return;
     }
 
+    //
+    // ack for '$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0'
+    //
     if (!strncmp(sentence, "$PMTK001,314,3*36", 16))
     {
         dbprintf("sentence acked: %s\n", sentence);
