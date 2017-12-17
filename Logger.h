@@ -32,7 +32,7 @@
 #endif
 
 #define USE_TCP
-//#define USE_NETWORK
+#define USE_NETWORK
 
 #ifdef USE_NETWORK
 #ifdef USE_TCP

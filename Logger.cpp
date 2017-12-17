@@ -37,7 +37,6 @@
 #undef dbflush
 
 #define DBP_BUF_SIZE 256
-extern unsigned int snprintf(char*, unsigned int, ...);
 #define dbprintf(...)  {char dbp_buf[DBP_BUF_SIZE]; snprintf(dbp_buf, DBP_BUF_SIZE-1, __VA_ARGS__); Serial.print(dbp_buf);}
 #define dbprintln(x)   Serial.println(x)
 #if !defined(AVOID_FLUSH)
@@ -135,7 +134,7 @@ void Logger::send(const char* message)
 
     if (!WiFi.isConnected())
     {
-        dbprintln("Logger::log: WiFi not connected!");
+        dbprintf("Logger::log: WiFi not connected! status: %d\n", WiFi.status());
         return;
     }
 

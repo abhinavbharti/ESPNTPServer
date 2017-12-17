@@ -47,12 +47,6 @@ volatile uint32_t last_micros;
 volatile uint32_t min_micros;
 volatile uint32_t max_micros;
 
-#if defined(MICROS_HISTORY_SIZE)
-volatile uint32_t micros_history[MICROS_HISTORY_SIZE];
-volatile uint16_t micros_history_count;
-volatile uint16_t micros_history_index;
-#endif
-
 #if defined(USE_ASYNC_UDP)
 AsyncUDP udp;
 #else
@@ -192,18 +186,6 @@ void IRAM_ATTR oneSecondInterrupt()
         max_micros = micros_count;
     }
 
-#if defined(MICROS_HISTORY_SIZE)
-    micros_history[micros_history_index++] = micros_count;
-    if (micros_history_index >= MICROS_HISTORY_SIZE)
-    {
-        micros_history_index = 0;
-    }
-    if (micros_history_count < MICROS_HISTORY_SIZE)
-    {
-        micros_history_count++;
-    }
-#endif
-
 #if defined(DEBUG) && defined(LED_PIN)
     digitalWrite(LED_PIN, digitalRead(LED_PIN) ? LOW : HIGH);
 #endif
@@ -265,6 +247,7 @@ void recievePacket()
     if (udp.available() != sizeof(NTPPacket))
     {
         dbprintf("recievePacket: ignoring packet with bad length: %d < %d\n", udp.available(), sizeof(NTPPacket));
+        udp.flush();
         return;
     }
 #endif
@@ -272,6 +255,7 @@ void recievePacket()
     if (!valid)
     {
         dbprintln("recievePacket: GPS data not valid!");
+        udp.flush();
         return;
     }
 
@@ -279,8 +263,8 @@ void recievePacket()
     memcpy(&ntp, aup.data(), sizeof(ntp));
 #else
     udp.read((unsigned char*)&ntp, sizeof(ntp));
-
 #endif
+
     ntp.delay              = ntohl(ntp.delay);
     ntp.dispersion         = ntohl(ntp.dispersion);
     ntp.orig_time.seconds  = ntohl(ntp.orig_time.seconds);
@@ -325,7 +309,6 @@ void recievePacket()
     uint16_t port     = udp.remotePort();
     udp.beginPacket(address, port);
     udp.write((uint8_t*)&ntp, sizeof(ntp));
-    udp.flush();
     udp.endPacket();
 #endif
     ++rsp_count;
@@ -577,30 +560,16 @@ void updateDisplay()
     display.display();
 }
 
-void setup()
+void startWiFi()
 {
-    delay(5000); // delay for IDE to re-open serial
-    gps.begin(9600);
-    dbbegin(115200);
-    dbprintln("\n\nStartup!\n");
-
-    pinMode(SYNC_PIN, INPUT);
-#if defined(LED_PIN)
-    pinMode(LED_PIN, OUTPUT);
-#endif
-
-    valid       = false;
-    valid_count = 0;
-    seconds     = 0;
-    max_micros  = 0;
-    min_micros  = 0;
-    last_micros = 0;
-#if defined(MICROS_HISTORY_SIZE)
-    micros_history_count = 0;
-    micros_history_index = 0;
-#endif
-
 #if !defined(USE_NO_WIFI)
+    WiFi.begin();
+    bool auto_reconnect = WiFi.getAutoReconnect();
+    if (!auto_reconnect)
+    {
+        dbprintln("setting auto-reconnect true!\n");
+        WiFi.setAutoReconnect(true);
+    }
     WiFiManager wifi;
     //wifi.setDebugOutput(false);
 #if defined(ESP_PLATFORM)
@@ -617,6 +586,28 @@ void setup()
     dbprintln("Network logging started!");
 #endif
 #endif
+}
+
+void setup()
+{
+    delay(5000); // delay for IDE to re-open serial
+    gps.begin(9600);
+    dbbegin(115200);
+    dbprintln("\n\nStartup!\n");
+
+    pinMode(PPS_PIN, INPUT);
+#if defined(LED_PIN)
+    pinMode(LED_PIN, OUTPUT);
+#endif
+
+    valid       = false;
+    valid_count = 0;
+    seconds     = 0;
+    max_micros  = 0;
+    min_micros  = 0;
+    last_micros = 0;
+
+    startWiFi();
 
     if (!display.init())
     {
@@ -653,7 +644,7 @@ void setup()
     }
 #endif
 
-    attachInterrupt(SYNC_PIN, &oneSecondInterrupt, FALLING);
+    attachInterrupt(PPS_PIN, &oneSecondInterrupt, FALLING);
 
 #if defined(USE_ASYNC_UDP)
     udp.onPacket(recievePacket);
@@ -669,6 +660,14 @@ void setup()
 
 void loop()
 {
+#if !defined(USE_NO_WIFI)
+    if (!WiFi.isConnected())
+    {
+        dbprintln("WiFi connection lost, restarting!");
+        startWiFi();
+    }
+#endif
+
 #if !defined(USE_ASYNC_UDP)
     if (udp.parsePacket())
     {
@@ -689,22 +688,6 @@ void loop()
     {
         if (seconds != last_seconds && ((seconds % 60) == 0 || valid_in))
         {
-#if defined(MICROS_HISTORY_SIZE)
-            double mean = 0.0;
-            for (int i = 0; i < micros_history_count; ++i)
-            {
-                mean += us2s(micros_history[i]);
-            }
-            mean = mean / micros_history_count;
-
-            double stdev = 0.0;
-            for (int i = 0; i < micros_history_count; ++i)
-            {
-                stdev += pow(us2s(micros_history[i]) - mean, 2);
-            }
-            stdev = sqrt(stdev / micros_history_count);
-            dbprintf("mean:%f stdev:%f ", mean, stdev);
-#endif
             double disp = us2s(MAX(abs(MICROS_PER_SEC-max_micros), abs(MICROS_PER_SEC-min_micros)));
             dispersion  = (uint32_t)(disp * 65536.0);
             dbprintf("min:%lu max:%lu jitter:%lu valid_count:%lu valid:%s numsat:%d heap:%ld valid_in:%d badcs: %lu\n", min_micros, max_micros,

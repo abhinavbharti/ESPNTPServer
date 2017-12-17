@@ -77,14 +77,14 @@ public:
 #endif
 
 #if defined(ESP_PLATFORM)
-#define SYNC_PIN               19
+#define PPS_PIN                19
 #define GPS_RX_PIN             16
 #define GPS_TX_PIN             17
 #define GPS_EN_PIN             18
 #else
 // pin definitions
 #define LED_PIN                BUILTIN_LED   // LED on pin, active low
-#define SYNC_PIN               D5   // (GPIO14) pin tied to 1hz square wave from GPS
+#define PPS_PIN                D5   // (GPIO14) pin tied to 1hz square wave from GPS
 #define GPS_RX_PIN             D6   // (GPIO12)
 #define GPS_TX_PIN             D7   // (GPIO13)
 #define GPS_EN_PIN             D4   // (GPIO2)
@@ -102,7 +102,6 @@ public:
 #define NMEA_BUFFER_SIZE       128
 #define VALIDITY_CHECK_MS      1100
 #define PPS_VALID_COUNT        60   // must have at least this many "good" PPS interrupts to be valid
-//#define MICROS_HISTORY_SIZE    1000
 
 #define us2s(x) (((double)x)/(double)MICROS_PER_SEC) // microseconds to seconds
 
