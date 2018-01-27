@@ -31,8 +31,9 @@
 #include <ESP8266WiFi.h>
 #endif
 
-#define USE_TCP
-#define USE_NETWORK
+#undef send
+//#define USE_TCP
+//#define USE_NETWORK
 
 #ifdef USE_NETWORK
 #ifdef USE_TCP

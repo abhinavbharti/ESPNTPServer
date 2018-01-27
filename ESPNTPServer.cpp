@@ -21,10 +21,17 @@
  */
 
 #include "ESPNTPServer.h"
-#include <lwip/def.h> // htonl() & ntohl()
 #define DEBUG
 //define NTP_PACKET_DEBUG
 #include "Logger.h"
+#include <lwip/def.h> // htonl() & ntohl()
+#include "freertos/FreeRTOS.h"
+#include "lwip/ip_addr.h"
+#include "lwip/pbuf.h"
+#include "lwip/igmp.h"
+#include "lwip/udp.h"
+#include "lwip/tcpip.h"
+#include "lwip/priv/tcpip_priv.h"
 
 Ticker            validityTimer;
 volatile bool     valid;
@@ -47,10 +54,12 @@ volatile uint32_t last_micros;
 volatile uint32_t min_micros;
 volatile uint32_t max_micros;
 
+#if defined(ESP8266)
 #if defined(USE_ASYNC_UDP)
 AsyncUDP udp;
 #else
 WiFiUDP udp;
+#endif
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -93,7 +102,7 @@ void IRAM_ATTR invalidate(const char* fmt, ...)
 {
     va_list argp;
     va_start(argp, fmt);
-    if (reason[0] != '\0')
+    if (reason[0] == '\0')
     {
         vsnprintf((char*)reason, sizeof(reason)-1, fmt, argp);
     }
@@ -110,21 +119,24 @@ void IRAM_ATTR invalidate(const char* fmt, ...)
     valid_in    = 0;
     nmea.clear();
 
-    //
-    // restart the validity timer, if it runs out we invalidate our data.
-    //
     display_now = true;
 }
 
 void IRAM_ATTR invalidateTime()
 {
     invalidate("Timer: %f\n", us2s(micros()-last_micros));
+    //
+    // restart the validity timer, if it runs out we invalidate our data.
+    //
     validityTimer.attach_ms(VALIDITY_CHECK_MS, &invalidateTime);
 }
 
 
 void IRAM_ATTR oneSecondInterrupt()
 {
+#if 1
+    digitalWrite(LED_PIN, HIGH);
+#endif
     uint32_t cur_micros = micros();
 
     //
@@ -156,6 +168,7 @@ void IRAM_ATTR oneSecondInterrupt()
             valid       = true;
             since       = seconds;
             ++valid_count;
+            reason[0] = '\0';
         }
     }
 
@@ -186,16 +199,19 @@ void IRAM_ATTR oneSecondInterrupt()
         max_micros = micros_count;
     }
 
+#if 1
+    digitalWrite(LED_PIN, LOW);
+#else
 #if defined(DEBUG) && defined(LED_PIN)
     digitalWrite(LED_PIN, digitalRead(LED_PIN) ? LOW : HIGH);
 #endif
+#endif
 }
 
-void getNTPTime(NTPTime *time)
+void IRAM_ATTR getNTPTime(NTPTime *time)
 {
     time->seconds = toNTP(seconds);
-    uint32_t cur_micros   = micros();
-    uint32_t micros_delta = cur_micros - last_micros;
+    uint32_t micros_delta = micros() - last_micros;
 
     //
     // if micros_delta is at or bigger than one second then
@@ -207,8 +223,7 @@ void getNTPTime(NTPTime *time)
         return;
     }
 
-    double percent = us2s(micros_delta);
-    time->fraction = (uint32_t)(percent * (double)4294967296L);
+    time->fraction = (uint32_t)(us2s(micros_delta) * (double)4294967296L);
 }
 
 int8_t computePrecision()
@@ -227,8 +242,9 @@ int8_t computePrecision()
     return (int8_t)prec;
 }
 
+#if defined(ESP8266)
 #if defined(USE_ASYNC_UDP)
-void recievePacket(AsyncUDPPacket aup)
+void IRAM_ATTR recievePacket(AsyncUDPPacket aup)
 #else
 void recievePacket()
 #endif
@@ -255,7 +271,9 @@ void recievePacket()
     if (!valid)
     {
         dbprintln("recievePacket: GPS data not valid!");
+#if !defined(USE_ASYNC_UDP)
         udp.flush();
+#endif
         return;
     }
 
@@ -313,6 +331,7 @@ void recievePacket()
 #endif
     ++rsp_count;
 }
+#endif
 
 void badChecksum(MicroNMEA& mn)
 {
@@ -560,6 +579,22 @@ void updateDisplay()
     display.display();
 }
 
+String constructSSID()
+{
+#if defined(ESP_PLATFORM)
+    uint8_t baseMac[6];
+    // Get MAC address for WiFi station
+    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+    char baseMacChr[18] = {0};
+    sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X", baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
+    String ssid = String("ESPNTPServer") + baseMacChr;
+#else
+    String ssid = "ESPNTPServer" + String(ESP.getChipId());
+#endif
+    return ssid;
+}
+
+
 void startWiFi()
 {
 #if !defined(USE_NO_WIFI)
@@ -572,11 +607,7 @@ void startWiFi()
     }
     WiFiManager wifi;
     //wifi.setDebugOutput(false);
-#if defined(ESP_PLATFORM)
-    String ssid = "ESPNTPServer" + WiFi.macAddress();
-#else
-    String ssid = "ESPNTPServer" + String(ESP.getChipId());
-#endif
+    String ssid = constructSSID();
     wifi.autoConnect(ssid.c_str(), NULL);
 #if !defined(ESP_PLATFORM)
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
@@ -587,6 +618,130 @@ void startWiFi()
 #endif
 #endif
 }
+
+#if defined(ESP_PLATFORM)
+
+
+void ntpTask(void *pvParameters)
+{
+    static NTPPacket ntp;
+    static int udp_server = -1;
+
+    dbprintln("ntpTask: starting!");
+
+    if ((udp_server=socket(AF_INET, SOCK_DGRAM, 0)) == -1)
+    {
+        dbprintf("ntpTask: could not create socket: %d", errno);
+        return;
+    }
+
+    int yes = 1;
+    if (setsockopt(udp_server,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes)) < 0)
+    {
+        dbprintf("ntpTask: could not set socket option: %d", errno);
+        return;
+    }
+
+    struct sockaddr_in addr;
+    memset((char *) &addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(NTP_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if(bind(udp_server , (struct sockaddr*)&addr, sizeof(addr)) == -1)
+    {
+        dbprintf("could not bind socket: %d", errno);
+        return;
+    }
+    for(;;)
+    {
+        int len;
+        int slen = sizeof(addr);
+        if ((len = recvfrom(udp_server, &ntp, sizeof(ntp), 0, (struct sockaddr *) &addr, (socklen_t *)&slen)) == -1)
+        {
+            dbprintf("ntpTask: could not receive data: %d", errno);
+            continue;
+        }
+
+        ++req_count;
+
+        NTPTime   recv_time;
+        getNTPTime(&recv_time);
+
+        if (len != sizeof(NTPPacket))
+        {
+            dbprintf("ntpTask: ignoring packet with bad length: %d < %d\n", len, sizeof(ntp));
+            continue;
+        }
+
+        if (!valid)
+        {
+            dbprintln("recievePacket: GPS data not valid!");
+            display_now = true;
+            continue;
+        }
+
+        ntp.delay              = ntohl(ntp.delay);
+        ntp.dispersion         = ntohl(ntp.dispersion);
+        ntp.orig_time.seconds  = ntohl(ntp.orig_time.seconds);
+        ntp.orig_time.fraction = ntohl(ntp.orig_time.fraction);
+        ntp.ref_time.seconds   = ntohl(ntp.ref_time.seconds);
+        ntp.ref_time.fraction  = ntohl(ntp.ref_time.fraction);
+        ntp.recv_time.seconds  = ntohl(ntp.recv_time.seconds);
+        ntp.recv_time.fraction = ntohl(ntp.recv_time.fraction);
+        ntp.xmit_time.seconds  = ntohl(ntp.xmit_time.seconds);
+        ntp.xmit_time.fraction = ntohl(ntp.xmit_time.fraction);
+        dumpNTPPacket(&ntp);
+
+        //
+        // Build the response
+        //
+        ntp.flags      = setLI(LI_NONE) | setVERS(NTP_VERSION) | setMODE(MODE_SERVER);
+        ntp.stratum    = 1;
+        ntp.precision  = precision;
+        // TODO: compute actual root delay, and root dispersion
+        ntp.delay = (uint32_t)(0.000001 * 65536);
+        ntp.dispersion = dispersion;
+        strncpy((char*)ntp.ref_id, REF_ID, sizeof(ntp.ref_id));
+        ntp.orig_time  = ntp.xmit_time;
+        ntp.recv_time  = recv_time;
+        getNTPTime(&(ntp.ref_time));
+        dumpNTPPacket(&ntp);
+        ntp.delay              = htonl(ntp.delay);
+        ntp.dispersion         = htonl(ntp.dispersion);
+        ntp.orig_time.seconds  = htonl(ntp.orig_time.seconds);
+        ntp.orig_time.fraction = htonl(ntp.orig_time.fraction);
+        ntp.ref_time.seconds   = htonl(ntp.ref_time.seconds);
+        ntp.ref_time.fraction  = htonl(ntp.ref_time.fraction);
+        ntp.recv_time.seconds  = htonl(ntp.recv_time.seconds);
+        ntp.recv_time.fraction = htonl(ntp.recv_time.fraction);
+        getNTPTime(&(ntp.xmit_time));
+        ntp.xmit_time.seconds  = htonl(ntp.xmit_time.seconds);
+        ntp.xmit_time.fraction = htonl(ntp.xmit_time.fraction);
+
+        int sent = sendto(udp_server, &ntp, sizeof(ntp), 0, (struct sockaddr*) &addr, sizeof(addr));
+        if(sent < 0)
+        {
+          dbprintf("could not send data: %d", errno);
+          continue;
+        }
+        ++rsp_count;
+    }
+}
+
+void displayTask(void *pvParameters)
+{
+    dbprintln("displayTask: starting!");
+    for(;;)
+    {
+        if (display_now)
+        {
+            display_now = false;
+            updateDisplay();
+        }
+        delay(10);
+    }
+}
+#endif
 
 void setup()
 {
@@ -631,6 +786,7 @@ void setup()
     //
     // initialize UDP handler
     //
+#if defined(ESP8266)
 #if defined(USE_ASYNC_UDP)
     while (!udp.listen(NTP_PORT))
     {
@@ -642,6 +798,7 @@ void setup()
         delay(1000);
         dbprintf("setup: retrying!\n");
     }
+#endif
 #endif
 
     attachInterrupt(PPS_PIN, &oneSecondInterrupt, FALLING);
@@ -656,6 +813,11 @@ void setup()
     first_gps_valid = 0;
     reason[0] = '\0';
     strncpy((char*)reason, "<unknown>", sizeof(reason)-1);
+
+#if defined(ESP_PLATFORM)
+    xTaskCreatePinnedToCore(ntpTask,     "ntpTask",     8192, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(displayTask, "displayTask", 8192, NULL, 1, NULL, 1);
+#endif
 }
 
 void loop()
@@ -668,7 +830,7 @@ void loop()
     }
 #endif
 
-#if !defined(USE_ASYNC_UDP)
+#if !defined(USE_ASYNC_UDP)  && defined(ESP8266)
     if (udp.parsePacket())
     {
         recievePacket();
@@ -704,11 +866,12 @@ void loop()
 
     last_seconds = seconds;
 
+#if !defined(ESP_PLATFORM)
     if (display_now)
     {
         display_now = false;
         updateDisplay();
     }
+#endif
     delay(1);
 }
-

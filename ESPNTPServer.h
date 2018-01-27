@@ -23,7 +23,9 @@
 #if defined(ESP_PLATFORM)
 #define AVOID_FLUSH // https://github.com/espressif/arduino-esp32/issues/854
 #endif
+#if defined(ESP8266)
 //#define USE_ASYNC_UDP
+#endif
 //#define USE_NO_WIFI
 #define LOG_HOST "192.168.0.31"
 #define LOG_PORT 1421
@@ -32,6 +34,7 @@
 #define _ESPNTPServer_H_
 #include "Arduino.h"
 #if defined(ESP_PLATFORM)
+#include "esp_system.h" // for esp_read_mac() used in constructSSID()
 class Ticker {
 public:
   hw_timer_t * timer = NULL;
@@ -70,13 +73,20 @@ public:
 
 #include "SSD1306Wire.h"
 
+
 #if defined(USE_ASYNC_UDP)
 #include "ESPAsyncUDP.h"
 #else
+#if defined(ESP8266)
 #include <WiFiUdp.h>
+#endif
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+#include <errno.h>
 #endif
 
 #if defined(ESP_PLATFORM)
+#define LED_PIN                15
 #define PPS_PIN                19
 #define GPS_RX_PIN             16
 #define GPS_TX_PIN             17
@@ -100,7 +110,7 @@ public:
 #define MICROS_PER_SEC         1000000
 #define SERIAL_BUFFER_SIZE     128
 #define NMEA_BUFFER_SIZE       128
-#define VALIDITY_CHECK_MS      1100
+#define VALIDITY_CHECK_MS      1001
 #define PPS_VALID_COUNT        60   // must have at least this many "good" PPS interrupts to be valid
 
 #define us2s(x) (((double)x)/(double)MICROS_PER_SEC) // microseconds to seconds
